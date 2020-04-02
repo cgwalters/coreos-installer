@@ -21,14 +21,16 @@ name = "coreos-installer"
 path = "src/main.rs"
 
 [profile.release]
-lto = true
+#lto = true
 
 [dependencies]
 byte-unit = "^3.0"
 clap = "^2.33"
 cpio = "^0.2"
+crossbeam-utils = "0.7.2"
 error-chain = { version = "^0.12", default-features = false }
 flate2 = "^1.0"
+libc = "0.2.68"
 nix = "^0.17"
 progress-streams = "^1.1"
 regex = "^1.3"

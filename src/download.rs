@@ -17,8 +17,10 @@ use error_chain::bail;
 use flate2::read::GzDecoder;
 use nix::unistd::isatty;
 use progress_streams::ProgressReader;
+use crossbeam_utils::thread;
 use std::fs::{remove_file, File, OpenOptions};
-use std::io::{copy, stderr, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{stderr, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::io::FromRawFd;
 use std::num::NonZeroU32;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -162,6 +164,28 @@ fn write_image_and_sig(
     Ok(())
 }
 
+fn threaded_pipe_copy(src: &mut dyn Read, dest: &mut File) -> Result<()> {
+    let (pipe_r, pipe_w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    let pipe_r = unsafe { std::fs::File::from_raw_fd(pipe_r) };
+    let mut pipe_w = unsafe { std::fs::File::from_raw_fd(pipe_w) };
+
+    Ok(thread::scope(move |s| -> Result<()> {
+        let h = s.spawn(move |_| -> Result<()> {
+            loop {
+                let n = nix::fcntl::splice(pipe_r.as_raw_fd(), None, dest.as_raw_fd(), None, 16 * 1024 * 1024, nix::fcntl::SpliceFFlags::empty())?;
+                if n == 0 {
+                    break
+                }
+            }
+            Ok(())
+        });
+        let mut bufr = std::io::BufReader::with_capacity(16 * 1024, src);
+        std::io::copy(&mut bufr, &mut pipe_w)?;
+        drop(pipe_w);
+        Ok(h.join().expect("join")?)
+    }).expect("scope")?)
+}
+
 /// Copy the image to disk and verify its signature.
 pub fn write_image(
     source: &mut ImageSource,
@@ -169,6 +193,10 @@ pub fn write_image(
     decompress: bool,
     expected_sector_size: Option<NonZeroU32>,
 ) -> Result<()> {
+    // use nix::fcntl::FcntlArg;
+    // use nix::fcntl::OFlag;
+    // nix::fcntl::fcntl(dest.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_DIRECT | OFlag::O_WRONLY | OFlag::O_CLOEXEC))?;
+
     // wrap source for GPG verification
     let mut verify_reader: Box<dyn Read> = {
         if let Some(signature) = source.signature.as_ref() {
@@ -286,7 +314,7 @@ pub fn write_image(
     // sparse-copy the image, falling back to non-sparse copy if hardware
     // acceleration is unavailable.  But BLKZEROOUT doesn't support
     // BLKDEV_ZERO_NOFALLBACK, so we'd risk gigabytes of redundant I/O.
-    copy(&mut decompress_reader, dest).chain_err(|| "decoding and writing image")?;
+    threaded_pipe_copy(&mut decompress_reader, dest).chain_err(|| "decoding and writing image")?;
 
     // verify_reader has now checked the signature, so fill in the first MiB
     dest.seek(SeekFrom::Start(0))
